@@ -57,7 +57,7 @@ class DockerError(Exception):
 class ConfigError(Exception):
     """Missing config or credentials"""
     pass
-STATE_FILE = "_langgraph_state.json"
+STATE_FILE = "_agent_state.json"
 DEPLOY_STATE_FILE = "_deploy_state.json"
 # ══════════════════════════════════════════════════════════════════════════════
 # RETRY DECORATOR
@@ -145,13 +145,7 @@ def _remove_readonly(func, path, _):
     func(path)
 
 def safe_rmtree(path):
-    try:
-        if sys.version_info >= (3, 12):
-            shutil.rmtree(path, onexc=_remove_readonly)
-        else:
-            shutil.rmtree(path, onerror=_remove_readonly)
-    except Exception:
-        pass
+    shutil.rmtree(path, onexc=_remove_readonly)
 
 def make_github_headers(token):
     return {
@@ -475,8 +469,6 @@ def fork_repo(repo_url, token):
     if response.status_code == 403 and "already exists" in response.text.lower():
         print("[Agent] Already forked — using existing fork")
         login = get_authenticated_user(token)
-        state["current_step"] = "authenticated"
-        save_state(state)
         return f"https://github.com/{login}/{repo.split('/')[-1]}.git"
 
     if response.status_code == 403:
@@ -519,27 +511,14 @@ def fork_repo(repo_url, token):
     return fork_url
 
 def download_repo(repo_url, fork_url, default_branch):
-    import re as _re
-    _m = _re.search(r'https?://github\.com/[^\s"\'<>]+', repo_url)
-    if _m:
-        repo_url = _m.group(0).rstrip("/")
     print(f"[Agent] Cloning latest upstream default branch: {default_branch}")
     repo_name = repo_url.split("/")[-1].replace(".git", "")
     if os.path.exists(repo_name):
         safe_rmtree(repo_name)
-    env = os.environ.copy()
-    env["GIT_LFS_SKIP_SMUDGE"] = "1"
-    result = subprocess.run(
+    subprocess.run(
         ["git", "clone", "--branch", default_branch, "--single-branch", repo_url, repo_name],
-        env=env
+        check=True
     )
-    if result.returncode != 0:
-        print("[Agent] ⚠️  Clone failed — retrying without LFS...")
-        subprocess.run(["git", "lfs", "uninstall"], capture_output=True)
-        subprocess.run(
-            ["git", "clone", "--branch", default_branch, "--single-branch", repo_url, repo_name],
-            check=True
-        )
     subprocess.run(["git", "remote", "rename", "origin", "upstream"], cwd=repo_name, check=True)
     subprocess.run(["git", "remote", "add", "origin", fork_url], cwd=repo_name, check=True)
     print("[Agent] Repo cloned from upstream:", repo_name)
@@ -2931,11 +2910,9 @@ def _handle_large_files(folder):
 
 
 @with_retry(max_attempts=3, delay=5, backoff=2, exceptions=(NetworkError,))
+>>>>>>> Stashed changes
 def push_branch(folder, fork_url, token):
-    _repo_path = fork_url.replace("https://github.com/", "").rstrip("/")
-    if _repo_path.endswith(".git"):
-        _repo_path = _repo_path[:-4]
-    auth_url = f"https://{token.strip()}@github.com/{_repo_path}"
+    auth_url = fork_url.replace("https://", f"https://{token}@")
 
     try:
         result = subprocess.run(
@@ -3146,35 +3123,7 @@ Return ONLY the JSON array:
     except Exception:
         return []
 
-def classify_deploy_error(msg: str, platform: str = ""):
-    msg_lower = msg.lower()
 
-    # Priority 1: QUOTA
-    if _is_quota_error(msg_lower):
-        return {
-            "type": "quota",
-            "message": f"{platform.upper()} quota exceeded. Add billing or upgrade plan."
-        }
-
-    # Priority 2: CREDENTIAL
-    elif _is_credential_error(msg_lower):
-        return {
-            "type": "credential",
-            "message": f"Invalid {platform.upper()} credentials. Please check tokens."
-        }
-
-    # Priority 3: NETWORK
-    elif _is_network_error(msg_lower):
-        return {
-            "type": "network",
-            "message": f"Network issue while deploying to {platform.upper()}."
-        }
-
-    # Default
-    return {
-        "type": "unknown",
-        "message": f"Deployment failed: {msg}"
-    }
 # ══════════════════════════════════════════════════════════════════════════════
 # PLATFORM DEPLOYERS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3426,23 +3375,15 @@ def deploy_to_render(fork_url, creds, folder=""):
     app_name = creds["app_name"]
     headers  = {"Authorization": f"Bearer {creds['api_key']}", "Content-Type": "application/json"}
 
-    owners_resp = requests.get(
+    owner_id = requests.get(
         "https://api.render.com/v1/owners?limit=1", headers=headers
-    )
-    if owners_resp.status_code != 200:
-        raise RuntimeError(f"Render auth failed: {owners_resp.status_code} — {owners_resp.text[:200]}")
-    owners_data = owners_resp.json()
-    if not owners_data:
-        raise RuntimeError("Render returned no owners — check your API key")
-    owner_id = owners_data[0]["owner"]["id"]
-    services_resp = requests.get(
+    ).json()[0]["owner"]["id"]
+
+    services = requests.get(
         "https://api.render.com/v1/services?limit=50", headers=headers
-    )
-    services = services_resp.json() if services_resp.status_code == 200 else []
-    existing = None
-    if isinstance(services, list):
-        existing = next((s["service"] for s in services
-                         if isinstance(s, dict) and s.get("service", {}).get("name") == app_name), None)
+    ).json()
+    existing = next((s["service"] for s in services
+                     if s["service"]["name"] == app_name), None)
 
     if existing:
         svc_id = existing["id"]
@@ -3491,267 +3432,337 @@ def deploy_to_render(fork_url, creds, folder=""):
     return url
 
 
+# def deploy_to_railway(folder, creds):
+#     app_name       = creds["app_name"]
+#     dockerhub_user = creds["dockerhub_user"]
+#     dockerhub_pass = creds["dockerhub_pass"]
+#     token          = creds["token"]
 
+#     # subprocess.run(["docker", "login", "--username", dockerhub_user, "--password-stdin"],
+#     #                input=dockerhub_pass.encode(), check=True)
+#     # print("[Railway] ✅ Docker Hub login")
+#     if dockerhub_user and dockerhub_pass:
+#         login = subprocess.run(
+#             ["docker", "login", "--username", dockerhub_user, "--password-stdin"],
+#             input=dockerhub_pass,
+#             text=True,
+#             capture_output=True
+#         )
+
+#         if login.returncode != 0:
+#             print("[Railway] ❌ Docker login failed")
+#             print(login.stderr)
+#             raise Exception("Docker login failed")
+#         else:
+#             print("[Railway] ✅ Docker Hub login successful")
+#     else:
+#         print("[Railway] ⚠️ Skipping Docker login (no credentials provided)")
+
+#     image_name = f"{dockerhub_user}/{app_name}:latest"
+#     subprocess.run(["docker", "build", "-t", image_name, "."], cwd=folder, check=True)
+#     subprocess.run(["docker", "push", image_name], check=True)
+#     print(f"[Railway] ✅ Pushed: {image_name}")
+
+#     headers     = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+#     graphql_url = "https://backboard.railway.app/graphql/v2"
+
+#     def gql(query):
+#         return requests.post(graphql_url, headers=headers, json={"query": query}).json()
+
+#     ws = gql("query { me { workspaces { id name } } }")
+#     if "errors" in ws:
+#         raise RuntimeError(f"Workspace error: {ws['errors']}")
+#     workspace_id = ws["data"]["me"]["workspaces"][0]["id"]
+
+#     proj = gql("""mutation { projectCreate(input:{name:"%s",workspaceId:"%s"}){
+#         id environments{edges{node{id name}}}}}""" % (app_name, workspace_id))
+#     if "errors" in proj:
+#         raise RuntimeError(f"Project error: {proj['errors']}")
+#     project_id     = proj["data"]["projectCreate"]["id"]
+#     environment_id = proj["data"]["projectCreate"]["environments"]["edges"][0]["node"]["id"]
+
+#     svc = gql("""mutation { serviceCreate(input:{projectId:"%s",name:"%s",
+#         source:{image:"%s"}}){id name}}""" % (project_id, app_name, image_name))
+#     if "errors" in svc:
+#         raise RuntimeError(f"Service error: {svc['errors']}")
+#     service_id = svc["data"]["serviceCreate"]["id"]
+
+#     railway_port = detect_port_from_dockerfile(folder, fallback="8000")
+#     gql("""mutation { variableUpsert(input:{projectId:"%s",environmentId:"%s",
+#         serviceId:"%s",name:"PORT",value:"%s"})}""" % (
+#         project_id, environment_id, service_id, railway_port))
+#     print(f"[Railway] ✅ PORT={railway_port} set")
+
+#     env_vars = creds.get("env_vars", {})
+#     if env_vars:
+#         print("[Railway] 📦 Pushing env vars to Railway...")
+#         for key, value in env_vars.items():
+#             resp = gql("""mutation { variableUpsert(input:{projectId:"%s",environmentId:"%s",
+#                 serviceId:"%s",name:"%s",value:"%s"})}""" % (
+#                 project_id, environment_id, service_id, key, value))
+#             if "errors" in resp:
+#                 print(f"[Railway] ⚠️  Failed to set {key}: {resp['errors']}")
+#             else:
+#                 print(f"[Railway] ✅ Set: {key}")
+#         print("[Railway] ✅ All env vars pushed to Railway")
+#     else:
+#         print("[Railway] ℹ️  No env vars provided — skipping")
+
+#     time.sleep(20)
+#     domain_q    = """mutation { serviceDomainCreate(input:{serviceId:"%s",environmentId:"%s"}){domain}}""" % (service_id, environment_id)
+#     domain_resp = gql(domain_q)
+#     if "errors" in domain_resp or not domain_resp.get("data", {}).get("serviceDomainCreate"):
+#         print("[Railway] Retrying domain creation in 15 seconds...")
+#         time.sleep(15)
+#         domain_resp = gql(domain_q)
+
+#     try:
+#         url = f"https://{domain_resp['data']['serviceDomainCreate']['domain']}"
+#     except Exception:
+#         url = f"https://railway.app/project/{project_id}"
+#         print("[Railway] ⚠️  Get domain manually from Railway dashboard")
+
+#     print(f"[Railway] ✅ {url}")
+#     return url
 
 
 def deploy_to_railway(folder, creds):
-    try:
+    import subprocess, requests, time
 
-        import subprocess, requests, time
+    app_name       = creds.get("app_name")
+    dockerhub_user = creds.get("dockerhub_user")
+    dockerhub_pass = creds.get("dockerhub_pass")
+    token          = creds.get("token")
 
-        app_name       = creds.get("app_name")
-        dockerhub_user = creds.get("dockerhub_user")
-        dockerhub_pass = creds.get("dockerhub_pass")
-        token          = creds.get("token")
+    if not app_name:
+        raise Exception("App name is required")
 
-        if not app_name:
-            raise Exception("App name is required")
+    if not token:
+        raise Exception("Railway token is required")
 
-        if not token:
-            raise Exception("Railway token is required")
+    # ─────────────────────────────────────────────
+    # 1. Docker Login (Optional)
+    # ─────────────────────────────────────────────
+    if dockerhub_user and dockerhub_pass:
+        print("[Railway] 🔐 Logging into Docker Hub...")
 
-        # ─────────────────────────────────────────────
-        # 1. Docker Login (Optional)
-        # ─────────────────────────────────────────────
-        if dockerhub_user and dockerhub_pass:
-            print("[Railway] 🔐 Logging into Docker Hub...")
+        login = subprocess.run(
+            ["docker", "login", "--username", dockerhub_user, "--password-stdin"],
+            input=dockerhub_pass,
+            text=True,
+            capture_output=True
+        )
 
-            login = subprocess.run(
-                ["docker", "login", "--username", dockerhub_user, "--password-stdin"],
-                input=dockerhub_pass,
-                text=True,
-                capture_output=True
-            )
-
-            if login.returncode != 0:
-                print("[Railway] ❌ Docker login failed")
-                print(login.stderr)
-                raise Exception("Docker login failed")
-            else:
-                print("[Railway] ✅ Docker Hub login successful")
+        if login.returncode != 0:
+            print("[Railway] ❌ Docker login failed")
+            print(login.stderr)
+            raise Exception("Docker login failed")
         else:
-            print("[Railway] ⚠️ Skipping Docker login (no credentials provided)")
+            print("[Railway] ✅ Docker Hub login successful")
+    else:
+        print("[Railway] ⚠️ Skipping Docker login (no credentials provided)")
 
-        # ─────────────────────────────────────────────
-        # 2. Build Image
-        # ─────────────────────────────────────────────
-        image_name = f"{dockerhub_user}/{app_name}:latest" if dockerhub_user else f"{app_name}:latest"
+    # ─────────────────────────────────────────────
+    # 2. Build Image
+    # ─────────────────────────────────────────────
+    image_name = f"{dockerhub_user}/{app_name}:latest" if dockerhub_user else f"{app_name}:latest"
 
-        print(f"[Railway] 🏗️ Building Docker image: {image_name}")
+    print(f"[Railway] 🏗️ Building Docker image: {image_name}")
 
-        build = subprocess.run(
-            ["docker", "build", "-t", image_name, "."],
-            cwd=folder,
+    build = subprocess.run(
+        ["docker", "build", "-t", image_name, "."],
+        cwd=folder,
+        capture_output=True,
+        text=True
+    )
+
+    if build.returncode != 0:
+        print("[Railway] ❌ Docker build failed")
+        print(build.stderr)
+        raise Exception("Docker build failed")
+
+    print("[Railway] ✅ Docker build successful")
+
+    # ─────────────────────────────────────────────
+    # 3. Push Image (ONLY if logged in)
+    # ─────────────────────────────────────────────
+    if dockerhub_user and dockerhub_pass:
+        print("[Railway] 🚀 Pushing image to Docker Hub...")
+
+        push = subprocess.run(
+            ["docker", "push", image_name],
             capture_output=True,
             text=True
         )
 
-        if build.returncode != 0:
-            print("[Railway] ❌ Docker build failed")
-            print(build.stderr)
-            # raise Exception("Docker build failed")
-            raise Exception(f"Docker build failed: {build.stderr}")
+        if push.returncode != 0:
+            print("[Railway] ❌ Docker push failed")
+            print(push.stderr)
+            raise Exception("Docker push failed")
 
-        print("[Railway] ✅ Docker build successful")
+        print(f"[Railway] ✅ Pushed: {image_name}")
+    else:
+        raise Exception("Docker Hub credentials required for Railway deploy (image must be public or pushed)")
 
-        # ─────────────────────────────────────────────
-        # 3. Push Image (ONLY if logged in)
-        # ─────────────────────────────────────────────
-        if dockerhub_user and dockerhub_pass:
-            print("[Railway] 🚀 Pushing image to Docker Hub...")
+    # ─────────────────────────────────────────────
+    # 4. Railway GraphQL Setup
+    # ─────────────────────────────────────────────
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
 
-            push = subprocess.run(
-                ["docker", "push", image_name],
-                capture_output=True,
-                text=True
-            )
+    graphql_url = "https://backboard.railway.app/graphql/v2"
 
-            if push.returncode != 0:
-                print("[Railway] ❌ Docker push failed")
-                print(push.stderr)
-                raise Exception(f"Docker push failed: {push.stderr}")
+    def gql(query):
+        resp = requests.post(graphql_url, headers=headers, json={"query": query})
+        data = resp.json()
+        if "errors" in data:
+            raise RuntimeError(data["errors"])
+        return data
 
-            print(f"[Railway] ✅ Pushed: {image_name}")
-        else:
-            raise Exception("Docker Hub credentials required for Railway deploy (image must be public or pushed)")
+    print("[Railway] 🔗 Connecting to Railway...")
 
-        # ─────────────────────────────────────────────
-        # 4. Railway GraphQL Setup
-        # ─────────────────────────────────────────────
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json"
-        }
+    ws = gql("query { me { workspaces { id name } } }")
+    workspace_id = ws["data"]["me"]["workspaces"][0]["id"]
 
-        graphql_url = "https://backboard.railway.app/graphql/v2"
+    # ─────────────────────────────────────────────
+    # 5. Create Project
+    # ─────────────────────────────────────────────
+    print("[Railway] 📦 Creating project...")
 
-        def gql(query):
-            resp = requests.post(graphql_url, headers=headers, json={"query": query})
-            data = resp.json()
-            if "errors" in data:
-                raise RuntimeError(str(data["errors"]))
-            return data
-
-        print("[Railway] 🔗 Connecting to Railway...")
-
-        ws = gql("query { me { workspaces { id name } } }")
-        workspace_id = ws["data"]["me"]["workspaces"][0]["id"]
-
-        # ─────────────────────────────────────────────
-        # 5. Create Project
-        # ─────────────────────────────────────────────
-        print("[Railway] 📦 Creating project...")
-
-        proj = gql(f"""
-        mutation {{
-            projectCreate(input:{{
-                name:"{app_name}",
-                workspaceId:"{workspace_id}"
-            }}) {{
-                id
-                environments {{ edges {{ node {{ id name }} }} }}
-            }}
+    proj = gql(f"""
+    mutation {{
+        projectCreate(input:{{
+            name:"{app_name}",
+            workspaceId:"{workspace_id}"
+        }}) {{
+            id
+            environments {{ edges {{ node {{ id name }} }} }}
         }}
-        """)
+    }}
+    """)
 
-        project_id     = proj["data"]["projectCreate"]["id"]
-        environment_id = proj["data"]["projectCreate"]["environments"]["edges"][0]["node"]["id"]
+    project_id     = proj["data"]["projectCreate"]["id"]
+    environment_id = proj["data"]["projectCreate"]["environments"]["edges"][0]["node"]["id"]
 
-        # ─────────────────────────────────────────────
-        # 6. Create Service (Docker Image)
-        # ─────────────────────────────────────────────
-        print("[Railway] 🚀 Creating service...")
+    # ─────────────────────────────────────────────
+    # 6. Create Service (Docker Image)
+    # ─────────────────────────────────────────────
+    print("[Railway] 🚀 Creating service...")
 
-        svc = gql(f"""
-        mutation {{
-            serviceCreate(input:{{
-                projectId:"{project_id}",
-                name:"{app_name}",
-                source:{{ image:"{image_name}" }}
-            }}) {{
-                id
-                name
-            }}
+    svc = gql(f"""
+    mutation {{
+        serviceCreate(input:{{
+            projectId:"{project_id}",
+            name:"{app_name}",
+            source:{{ image:"{image_name}" }}
+        }}) {{
+            id
+            name
         }}
-        """)
+    }}
+    """)
 
-        service_id = svc["data"]["serviceCreate"]["id"]
+    service_id = svc["data"]["serviceCreate"]["id"]
 
-        # ─────────────────────────────────────────────
-        # 7. Set PORT
-        # ─────────────────────────────────────────────
-        railway_port = detect_port_from_dockerfile(folder, fallback="8000")
+    # ─────────────────────────────────────────────
+    # 7. Set PORT
+    # ─────────────────────────────────────────────
+    railway_port = detect_port_from_dockerfile(folder, fallback="8000")
 
-        gql(f"""
-        mutation {{
-            variableUpsert(input:{{
-                projectId:"{project_id}",
-                environmentId:"{environment_id}",
-                serviceId:"{service_id}",
-                name:"PORT",
-                value:"{railway_port}"
-            }})
+    gql(f"""
+    mutation {{
+        variableUpsert(input:{{
+            projectId:"{project_id}",
+            environmentId:"{environment_id}",
+            serviceId:"{service_id}",
+            name:"PORT",
+            value:"{railway_port}"
+        }})
+    }}
+    """)
+
+    print(f"[Railway] ✅ PORT={railway_port} set")
+
+    # ─────────────────────────────────────────────
+    # 8. Env Vars
+    # ─────────────────────────────────────────────
+    env_vars = creds.get("env_vars", {})
+
+    if env_vars:
+        print("[Railway] 📦 Setting environment variables...")
+
+        for key, value in env_vars.items():
+            try:
+                gql(f"""
+                mutation {{
+                    variableUpsert(input:{{
+                        projectId:"{project_id}",
+                        environmentId:"{environment_id}",
+                        serviceId:"{service_id}",
+                        name:"{key}",
+                        value:"{value}"
+                    }})
+                }}
+                """)
+                print(f"[Railway] ✅ {key}")
+            except Exception as e:
+                print(f"[Railway] ⚠️ Failed {key}: {e}")
+    else:
+        print("[Railway] ℹ️ No env vars provided")
+
+
+    # ─────────────────────────────────────────────
+    # 9. Trigger Deployment
+    # ─────────────────────────────────────────────
+    print("[Railway] 🚀 Triggering deployment...")
+    
+    gql(f"""
+    mutation {{
+        serviceInstanceDeploy(
+            serviceId: "{service_id}",
+            environmentId: "{environment_id}"
+        )
+    }}
+    """)
+
+    # ─────────────────────────────────────────────
+    # 10. Create Domain & Return URL
+    # ─────────────────────────────────────────────
+    print("[Railway] 🌐 Creating domain...")
+    time.sleep(20)  # Wait for service to be ready
+
+    domain_q = f"""
+    mutation {{
+        serviceDomainCreate(input:{{
+            serviceId: "{service_id}",
+            environmentId: "{environment_id}"
+        }}) {{
+            domain
         }}
-        """)
+    }}
+    """
+    domain_resp = gql(domain_q)
 
-        print(f"[Railway] ✅ PORT={railway_port} set")
-
-        # ─────────────────────────────────────────────
-        # 8. Env Vars
-        # ─────────────────────────────────────────────
-        env_vars = creds.get("env_vars", {})
-
-        if env_vars:
-            print("[Railway] 📦 Setting environment variables...")
-
-            for key, value in env_vars.items():
-                try:
-                    gql(f"""
-                    mutation {{
-                        variableUpsert(input:{{
-                            projectId:"{project_id}",
-                            environmentId:"{environment_id}",
-                            serviceId:"{service_id}",
-                            name:"{key}",
-                            value:"{value}"
-                        }})
-                    }}
-                    """)
-                    print(f"[Railway] ✅ {key}")
-                except Exception as e:
-                    print(f"[Railway] ⚠️ Failed {key}: {e}")
-        else:
-            print("[Railway] ℹ️ No env vars provided")
-
-
-        # ─────────────────────────────────────────────
-        # 9. Trigger Deployment
-        # ─────────────────────────────────────────────
-        print("[Railway] 🚀 Triggering deployment...")
-        
-        gql(f"""
-        mutation {{
-            serviceInstanceDeploy(
-                serviceId: "{service_id}",
-                environmentId: "{environment_id}"
-            )
-        }}
-        """)
-
-        # ─────────────────────────────────────────────
-        # 10. Create Domain & Return URL
-        # ─────────────────────────────────────────────
-        print("[Railway] 🌐 Creating domain...")
-        time.sleep(20)  # Wait for service to be ready
-
-        domain_q = f"""
-        mutation {{
-            serviceDomainCreate(input:{{
-                serviceId: "{service_id}",
-                environmentId: "{environment_id}"
-            }}) {{
-                domain
-            }}
-        }}
-        """
-        domain_resp = gql(domain_q)
-
+    try:
+        domain = domain_resp["data"]["serviceDomainCreate"]["domain"]
+        url = f"https://{domain}"
+    except Exception:
+        print("[Railway] ⚠️  Could not get domain — retrying in 15s...")
+        time.sleep(15)
         try:
+            domain_resp = gql(domain_q)
             domain = domain_resp["data"]["serviceDomainCreate"]["domain"]
             url = f"https://{domain}"
         except Exception:
-            print("[Railway] ⚠️  Could not get domain — retrying in 15s...")
-            time.sleep(15)
-            try:
-                domain_resp = gql(domain_q)
-                domain = domain_resp["data"]["serviceDomainCreate"]["domain"]
-                url = f"https://{domain}"
-            except Exception:
-                url = f"https://railway.app/project/{project_id}"
-                print("[Railway] ⚠️  Using project URL — check dashboard for actual domain")
+            url = f"https://railway.app/project/{project_id}"
+            print("[Railway] ⚠️  Using project URL — check dashboard for actual domain")
 
-        print(f"[Railway] ✅ Deployed: {url}")
-        print(f"[Railway] ⏳ App may take 1-2 minutes to fully start")
-        # In deploy_to_railway, change return to:
-        return url  # just the string
+    print(f"[Railway] ✅ Deployed: {url}")
+    print(f"[Railway] ⏳ App may take 1-2 minutes to fully start")
+    return url
 
-        # And the error case:
-        raise Exception(f"{error_info['message']}")
-        # instead of returning a dict
-    except Exception as e:
-            msg = str(e)
-
-            error_info = classify_deploy_error(msg, "railway")
-
-            print(f"[Railway] ❌ {error_info['message']}")
-            print(f"[Railway] 🧾 Raw: {msg}")
-
-            return {
-                "status": "failed",
-                "message": error_info["message"],
-                "type": error_info["type"],
-                "raw": msg
-            }
 
 
 def deploy_to_platforms(targets, folder, fork_url, creds):
@@ -3788,9 +3799,7 @@ def check_mode(folder):
     print(f"[Agent] Scanning: {os.path.abspath(folder)}\n")
 
     context = deep_scan_repo(folder)
-    state["context"] = context
-    state["current_step"] = "scanned"
-    save_state(state)
+
     print(f"\n[Agent] ── Detection Results ─────────────────────────────")
     print(f"  Language:    {context['detected_language']}")
     print(f"  Framework:   {context['detected_framework']}")
@@ -3867,7 +3876,6 @@ def node_authenticate(state: AgentState) -> AgentState:
                 "current_step": "authenticate"}
     try:
         fork_owner = get_authenticated_user(state["token"])
-        save_state({**state, "fork_owner": fork_owner, "current_step": "authenticate"})
         return {**state, "fork_owner": fork_owner, "current_step": "authenticate", "error": None}
     except ConfigError as e:
         return {**state, "error": f"Config error: {e}", "current_step": "authenticate"}
@@ -3883,7 +3891,6 @@ def node_get_default_branch(state: AgentState) -> AgentState:
         return {**state, "error": "repo_url is empty", "current_step": "get_branch"}
     try:
         branch = get_default_branch(state["repo_url"], state["token"])
-        save_state({**state, "default_branch": branch, "current_step": "get_branch"})
         return {**state, "default_branch": branch, "current_step": "get_branch", "error": None}
     except ConfigError as e:
         return {**state, "error": str(e), "current_step": "get_branch"}
@@ -3897,9 +3904,6 @@ def node_fork_repo(state: AgentState) -> AgentState:
     print("\n[Agent] ── Node: Fork Repo ───────────────────────────────")
     try:
         fork_url = fork_repo(state["repo_url"], state["token"])
-        state["fork_url"] = fork_url
-        state["current_step"] = "forked"
-        save_state(state)
         return {**state, "fork_url": fork_url, "current_step": "fork_repo", "error": None}
     except ConfigError as e:
         return {**state, "error": str(e), "current_step": "fork_repo"}
@@ -3931,9 +3935,6 @@ def node_clone_repo(state: AgentState) -> AgentState:
 
     try:
         folder = download_repo(state["repo_url"], state["fork_url"], state["default_branch"])
-        state["folder"] = folder
-        state["current_step"] = "cloned"
-        save_state(state)
         return {**state, "folder": folder, "current_step": "clone_repo", "error": None}
     except subprocess.CalledProcessError as e:
         return {**state, "error": f"Git clone failed: {e.stderr or e}", "current_step": "clone_repo"}
@@ -4043,11 +4044,6 @@ def node_pause_for_user(state: AgentState) -> AgentState:
             print("[Agent] ⏳ Take your time. Edit files, then type y when ready.")
         else:
             print("[Agent] Please type y or n.")
-    save_state({
-    **state,
-    "current_step": "pause_for_user",
-    "paused": False,   # ready to continue
-})
 
     return {**state, "current_step": "pause_for_user"}
 
@@ -4322,9 +4318,6 @@ Return ONLY this JSON:
 
 
         dockerfile_content, context = generate_dockerfile_with_openai(folder, openai_api_key)
-        state["dockerfile"] = dockerfile_content
-        state["current_step"] = "docker_generated"
-        save_state(state)
 
         gitignore_path = os.path.join(folder, ".gitignore")
         if os.path.exists(gitignore_path):
@@ -4405,9 +4398,6 @@ def node_test_docker(state: AgentState) -> AgentState:
         openai_api_key=openai_api_key,
         max_retries=3,
     )
-    state["test_passed"] = test_passed
-    state["current_step"] = "docker_tested"
-    save_state(state)
     return {**state, "test_passed": test_passed, "current_step": "test_docker"}
 
 
@@ -4767,9 +4757,7 @@ Return ONLY this JSON:
             if os.path.exists(old_folder):
                 safe_rmtree(old_folder)
 
-            _rp = state["repo_url"].replace("https://github.com/", "").rstrip("/")
-            if _rp.endswith(".git"): _rp = _rp[:-4]
-            auth_url = f"https://{state['token'].strip()}@github.com/{_rp}"
+            auth_url     = state["repo_url"].replace("https://", f"https://{state['token']}@")
             repo_name    = state["repo_url"].rstrip("/").split("/")[-1].replace(".git", "")
             subprocess.run(
                 ["git", "clone", "--branch", state["default_branch"], "--single-branch", auth_url, repo_name],
@@ -5115,7 +5103,6 @@ def node_deploy(state: AgentState) -> AgentState:
 
             except Exception as e:
                 error_msg = str(e)
-
                 print(f"\n[Deploy] ❌ {platform.upper()} failed (attempt {retry_count+1}): {error_msg}")
 
                 if _is_credential_error(error_msg) and retry_count < max_retries:
@@ -5190,11 +5177,7 @@ def node_deploy(state: AgentState) -> AgentState:
         failed = [p for p, r in all_results.items() if str(r).startswith("FAILED")]
         print(f"[Deploy] ⚠️  {len(failed)} platform(s) failed: {failed}")
         print(f"[Deploy] 💡 Fix and run:  python langgraph_agent.py --resume-deploy")
-    save_state({
-    **state,
-    "deploy_results": all_results,
-    "current_step": "deploy"
-})
+
     return {**state, "deploy_results": all_results, "current_step": "deploy"}
 
 
@@ -5452,81 +5435,35 @@ if __name__ == "__main__":
             print("[Agent] ❌ No paused session found. Run normally first.")
             sys.exit(1)
 
-        step = saved.get("current_step", "")
-        print(f"\n[Agent] ▶️  Resuming from step: '{step}'")
-        print(f"[Agent] Folder: {saved.get('folder', '(none)')}")
+        print(f"\n[Agent] ▶️  Resuming from paused state...")
+        print(f"[Agent] Folder: {saved['folder']}")
         os.remove(STATE_FILE)
 
         initial_state: AgentState = {
-            "repo_url":        saved.get("repo_url", ""),
-            "token":           saved.get("token", ""),
-            "openai_api_key":  saved.get("openai_api_key", ""),
-            "fork_owner":      saved.get("fork_owner", ""),
-            "default_branch":  saved.get("default_branch", ""),
-            "fork_url":        saved.get("fork_url", ""),
-            "folder":          saved.get("folder", ""),
-            "context":         saved.get("context", {}),
-            "dockerfile":      saved.get("dockerfile", ""),
-            "test_passed":     saved.get("test_passed", False),
-            "deploy_targets":  saved.get("deploy_targets", []),
-            "app_name":        saved.get("app_name", ""),
-            "deploy_results":  saved.get("deploy_results", {}),
-            "pr_approved":     saved.get("pr_approved", False),
-            "pr_url":          saved.get("pr_url", ""),
-            "deploy_approved": saved.get("deploy_approved", False),
-            "env_vars":        saved.get("env_vars", {}),
+            "repo_url":        saved["repo_url"],
+            "token":           saved["token"],
+            "openai_api_key":  saved["openai_api_key"],
+            "fork_owner":      saved["fork_owner"],
+            "default_branch":  saved["default_branch"],
+            "fork_url":        saved["fork_url"],
+            "folder":          saved["folder"],
+            "context":         {},
+            "dockerfile":      "",
+            "test_passed":     False,
+            "deploy_targets":  [],
+            "app_name":        "",
+            "deploy_results":  {},
+            "pr_approved":     False,
+            "pr_url":          "",
+            "deploy_approved": False,
+            "env_vars":        {},
             "paused":          False,
             "error":           None,
             "current_step":    "resume",
         }
 
-        # ── Route to correct graph entry point based on saved step ────
-        if step in ("push_and_create_pr", "hitl_deploy_approval",
-                    "collect_deploy_info", "deploy"):
-            # PR already created or past it — build mini graph from push onward
-            print(f"[Agent] ▶️  Resuming from PR/deploy stage...")
-
-            builder = StateGraph(AgentState)
-            builder.add_node("push_and_create_pr",    node_push_and_create_pr)
-            builder.add_node("hitl_deploy_approval",  node_hitl_deploy_approval)
-            builder.add_node("collect_deploy_info",   node_collect_deploy_info)
-            builder.add_node("deploy",                node_deploy)
-            builder.add_node("done",                  node_done)
-            builder.add_node("error",                 node_error)
-
-            builder.set_entry_point("push_and_create_pr")
-            builder.add_conditional_edges("push_and_create_pr",    route_after_push_pr,           {"hitl_deploy_approval": "hitl_deploy_approval", "error": "error"})
-            builder.add_conditional_edges("hitl_deploy_approval",  route_after_deploy_approval,   {"collect_deploy_info": "collect_deploy_info", "done": "done"})
-            builder.add_conditional_edges("collect_deploy_info",   route_after_collect_deploy,    {"deploy": "deploy", "done": "done"})
-            builder.add_edge("deploy", "done")
-            builder.add_edge("done",   END)
-            builder.add_edge("error",  END)
-
-            graph = builder.compile()
-            graph.invoke(initial_state)
-
-        elif step in ("pause_for_user",
-                      "create_branch_and_dockerfile",
-                      "test_docker",
-                      "hitl_pr_approval"):
-            # Editing/Dockerfile/test stage — resume from create_branch_and_dockerfile
-            print(f"[Agent] ▶️  Resuming from Dockerfile generation stage...")
-            graph = build_resume_graph()
-            graph.invoke(initial_state)
-
-        elif step in ("authenticate", "get_branch", "fork_repo", "clone_repo"):
-            # Very early stage — safest to re-run full graph
-            print(f"[Agent] ▶️  Early stage — restarting full pipeline...")
-            print(f"[Agent] ℹ️  Token and repo URL preserved from saved state")
-            graph = build_graph()
-            graph.invoke(initial_state)
-
-        else:
-            # Unknown step — fall back to resume graph
-            print(f"[Agent] ⚠️  Unknown step '{step}' — defaulting to Dockerfile stage")
-            graph = build_resume_graph()
-            graph.invoke(initial_state)
-
+        graph = build_resume_graph()
+        graph.invoke(initial_state)
         sys.exit(0)
 
     print("\n[Agent] ── Configuration ─────────────────────────────────")
